@@ -34,6 +34,9 @@
  *   onProgress: ProgressReporter | null
  * }} TurnCaptureState
  */
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { readJsonFile } from "./fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
@@ -76,9 +79,70 @@ function buildResumeParams(threadId, cwd, options = {}) {
   };
 }
 
+const SKILL_INVOCATION_PATTERN = /^\s*\$([A-Za-z][A-Za-z0-9_-]*)(?=\s|$)/;
+
+function parseSkillInvocation(text) {
+  if (typeof text !== "string") {
+    return null;
+  }
+  const match = text.match(SKILL_INVOCATION_PATTERN);
+  return match ? match[1] : null;
+}
+
+function skillSearchRoots(cwd) {
+  const roots = [];
+  if (cwd) {
+    let dir = path.resolve(cwd);
+    while (true) {
+      roots.push(path.join(dir, ".agents", "skills"));
+      const parent = path.dirname(dir);
+      if (parent === dir) {
+        break;
+      }
+      dir = parent;
+    }
+  }
+  const home = typeof os.homedir === "function" ? os.homedir() : null;
+  if (home) {
+    roots.push(path.join(home, ".agents", "skills"));
+  }
+  roots.push("/etc/codex/skills");
+  return roots;
+}
+
+function findSkillPath(cwd, name) {
+  for (const root of skillSearchRoots(cwd)) {
+    const candidate = path.join(root, name, "SKILL.md");
+    try {
+      if (fs.statSync(candidate).isFile()) {
+        return candidate;
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return null;
+}
+
+function resolveSkillInput(cwd, prompt) {
+  const name = parseSkillInvocation(prompt);
+  if (!name) {
+    return null;
+  }
+  const skillPath = findSkillPath(cwd, name);
+  if (!skillPath) {
+    return null;
+  }
+  return { name, path: skillPath };
+}
+
 /** @returns {UserInput[]} */
-function buildTurnInput(prompt) {
-  return [{ type: "text", text: prompt, text_elements: [] }];
+function buildTurnInput(prompt, skill = null) {
+  const items = [{ type: "text", text: prompt, text_elements: [] }];
+  if (skill) {
+    items.push({ type: "skill", name: skill.name, path: skill.path });
+  }
+  return items;
 }
 
 function shorten(text, limit = 72) {
@@ -1004,7 +1068,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       () =>
         client.request("turn/start", {
           threadId,
-          input: buildTurnInput(prompt),
+          input: buildTurnInput(prompt, resolveSkillInput(cwd, prompt)),
           model: options.model ?? null,
           effort: options.effort ?? null,
           outputSchema: options.outputSchema ?? null
