@@ -28,6 +28,7 @@ import {
   generateJobId,
   getConfig,
   listJobs,
+  resolveJobLogFile,
   setConfig,
   upsertJob,
   writeJobFile
@@ -66,6 +67,8 @@ const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
+const DEFAULT_WAIT_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_WAIT_POLL_INTERVAL_MS = 2000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
@@ -77,7 +80,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--wait|--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
@@ -554,6 +557,93 @@ function renderQueuedTaskLaunch(payload) {
   return `${payload.title} started in the background as ${payload.jobId}. Check /codex:status ${payload.jobId} for progress.\n`;
 }
 
+function makeLogTailer(logFile, asJson) {
+  let offset = 0;
+  return () => {
+    if (asJson) {
+      return;
+    }
+    let stat;
+    try {
+      stat = fs.statSync(logFile);
+    } catch {
+      return;
+    }
+    if (stat.size <= offset) {
+      return;
+    }
+    const length = stat.size - offset;
+    const buf = Buffer.alloc(length);
+    const fd = fs.openSync(logFile, "r");
+    try {
+      fs.readSync(fd, buf, 0, length, offset);
+    } finally {
+      fs.closeSync(fd);
+    }
+    offset = stat.size;
+    process.stderr.write(buf);
+  };
+}
+
+async function runWaitFlow({
+  cwd,
+  jobId,
+  jobTitle,
+  preambleLabel,
+  asJson,
+  timeoutMs,
+  pollIntervalMs
+}) {
+  const effectiveTimeoutMs = Math.max(0, Number(timeoutMs) || DEFAULT_WAIT_TIMEOUT_MS);
+  const effectivePollIntervalMs = Math.max(100, Number(pollIntervalMs) || DEFAULT_WAIT_POLL_INTERVAL_MS);
+  const deadline = Date.now() + effectiveTimeoutMs;
+
+  process.stderr.write(
+    `${preambleLabel} queued as ${jobId}; polling until completion. ` +
+      `Use /codex:result ${jobId} if this call is interrupted.\n`
+  );
+
+  const workspaceRoot = resolveCommandWorkspace({ cwd });
+  const logFile = resolveJobLogFile(workspaceRoot, jobId);
+  const flushLog = makeLogTailer(logFile, asJson);
+
+  let snapshot = buildSingleJobSnapshot(cwd, jobId);
+  flushLog();
+  while (isActiveJobStatus(snapshot.job.status) && Date.now() < deadline) {
+    await sleep(Math.min(effectivePollIntervalMs, Math.max(0, deadline - Date.now())));
+    flushLog();
+    snapshot = buildSingleJobSnapshot(cwd, jobId);
+  }
+  flushLog();
+
+  const timedOut = isActiveJobStatus(snapshot.job.status);
+  const storedJob = readStoredJob(snapshot.workspaceRoot, jobId);
+
+  if (timedOut) {
+    const message =
+      `${jobTitle} did not finish before --wait timeout (${effectiveTimeoutMs}ms). ` +
+      `Worker still running. Use /codex:status ${jobId} or /codex:result ${jobId} to follow up.`;
+    if (asJson) {
+      outputResult({ jobId, status: snapshot.job.status, waitTimedOut: true, message }, true);
+    } else {
+      process.stderr.write(`${message}\n`);
+    }
+    process.exitCode = 1;
+    return;
+  }
+
+  if (asJson) {
+    outputResult({ jobId, status: snapshot.job.status, job: snapshot.job, storedJob }, true);
+  } else {
+    const rendered = renderStoredJobResult(snapshot.job, storedJob ?? {});
+    process.stdout.write(rendered);
+  }
+
+  if (snapshot.job.status === "failed" || snapshot.job.status === "cancelled") {
+    process.exitCode = 1;
+  }
+}
+
 function getJobKindLabel(kind, jobClass) {
   if (kind === "adversarial-review") {
     return "adversarial-review";
@@ -598,6 +688,18 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
+function buildReviewRequest({ cwd, base, scope, model, focusText, reviewName, jobId }) {
+  return {
+    cwd,
+    base: base ?? null,
+    scope: scope ?? null,
+    model: model ?? null,
+    focusText: focusText ?? "",
+    reviewName,
+    jobId
+  };
+}
+
 function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
   return {
     cwd,
@@ -638,9 +740,9 @@ async function runForegroundCommand(job, runner, options = {}) {
   return execution;
 }
 
-function spawnDetachedTaskWorker(cwd, jobId) {
+function spawnDetachedWorker(cwd, jobId, workerSubcommand = "task-worker") {
   const scriptPath = path.join(ROOT_DIR, "scripts", "codex-companion.mjs");
-  const child = spawn(process.execPath, [scriptPath, "task-worker", "--cwd", cwd, "--job-id", jobId], {
+  const child = spawn(process.execPath, [scriptPath, workerSubcommand, "--cwd", cwd, "--job-id", jobId], {
     cwd,
     env: process.env,
     detached: true,
@@ -651,11 +753,11 @@ function spawnDetachedTaskWorker(cwd, jobId) {
   return child;
 }
 
-function enqueueBackgroundTask(cwd, job, request) {
+function enqueueBackgroundJob(cwd, job, request, workerSubcommand = "task-worker") {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
+  const child = spawnDetachedWorker(cwd, job.id, workerSubcommand);
   const queuedRecord = {
     ...job,
     status: "queued",
@@ -681,12 +783,16 @@ function enqueueBackgroundTask(cwd, job, request) {
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
+    valueOptions: ["base", "scope", "model", "cwd", "timeout-ms", "poll-interval-ms"],
     booleanOptions: ["json", "background", "wait"],
     aliasMap: {
       m: "model"
     }
   });
+
+  if (options.background && options.wait) {
+    throw new Error("Choose either --background or --wait.");
+  }
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
@@ -706,6 +812,31 @@ async function handleReviewCommand(argv, config) {
     jobClass: "review",
     summary: metadata.summary
   });
+
+  if (options.wait) {
+    ensureCodexAvailable(cwd);
+    const request = buildReviewRequest({
+      cwd,
+      base: options.base,
+      scope: options.scope,
+      model: options.model,
+      focusText,
+      reviewName: config.reviewName,
+      jobId: job.id
+    });
+    enqueueBackgroundJob(cwd, job, request, "review-worker");
+    await runWaitFlow({
+      cwd,
+      jobId: job.id,
+      jobTitle: job.title,
+      preambleLabel: `Codex ${config.reviewName}`,
+      asJson: options.json,
+      timeoutMs: options["timeout-ms"],
+      pollIntervalMs: options["poll-interval-ms"]
+    });
+    return;
+  }
+
   await runForegroundCommand(
     job,
     (progress) =>
@@ -722,6 +853,50 @@ async function handleReviewCommand(argv, config) {
   );
 }
 
+async function handleReviewWorker(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "job-id"]
+  });
+
+  if (!options["job-id"]) {
+    throw new Error("Missing required --job-id for review-worker.");
+  }
+
+  const workspaceRoot = resolveCommandWorkspace(options);
+  const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
+  if (!storedJob) {
+    throw new Error(`No stored job found for ${options["job-id"]}.`);
+  }
+
+  const request = storedJob.request;
+  if (!request || typeof request !== "object") {
+    throw new Error(`Stored job ${options["job-id"]} is missing its review request payload.`);
+  }
+
+  const { logFile, progress } = createTrackedProgress(
+    {
+      ...storedJob,
+      workspaceRoot
+    },
+    {
+      logFile: storedJob.logFile ?? null
+    }
+  );
+  await runTrackedJob(
+    {
+      ...storedJob,
+      workspaceRoot,
+      logFile
+    },
+    () =>
+      executeReviewRun({
+        ...request,
+        onProgress: progress
+      }),
+    { logFile }
+  );
+}
+
 async function handleReview(argv) {
   return handleReviewCommand(argv, {
     reviewName: "Review",
@@ -731,12 +906,16 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "timeout-ms", "poll-interval-ms"],
+    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "wait"],
     aliasMap: {
       m: "model"
     }
   });
+
+  if (options.background && options.wait) {
+    throw new Error("Choose either --background or --wait.");
+  }
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
@@ -755,7 +934,7 @@ async function handleTask(argv) {
     resumeLast
   });
 
-  if (options.background) {
+  if (options.background || options.wait) {
     ensureCodexAvailable(cwd);
     requireTaskRequest(prompt, resumeLast);
 
@@ -769,7 +948,21 @@ async function handleTask(argv) {
       resumeLast,
       jobId: job.id
     });
-    const { payload } = enqueueBackgroundTask(cwd, job, request);
+    const { payload } = enqueueBackgroundJob(cwd, job, request, "task-worker");
+
+    if (options.wait) {
+      await runWaitFlow({
+        cwd,
+        jobId: job.id,
+        jobTitle: job.title,
+        preambleLabel: "Codex task",
+        asJson: options.json,
+        timeoutMs: options["timeout-ms"],
+        pollIntervalMs: options["poll-interval-ms"]
+      });
+      return;
+    }
+
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
   }
@@ -1002,6 +1195,9 @@ async function main() {
       break;
     case "task-worker":
       await handleTaskWorker(argv);
+      break;
+    case "review-worker":
+      await handleReviewWorker(argv);
       break;
     case "status":
       await handleStatus(argv);

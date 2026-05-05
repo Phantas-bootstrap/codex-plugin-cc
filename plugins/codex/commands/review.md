@@ -16,7 +16,7 @@ Core constraint:
 - Your only job is to run the review and return Codex's output verbatim to the user.
 
 Execution mode rules:
-- If the raw arguments include `--wait`, do not ask. Run the review in the foreground.
+- If the raw arguments include `--wait`, do not ask. Run the review with `--wait` (the companion spawns a detached worker and polls for completion before returning the rendered review).
 - If the raw arguments include `--background`, do not ask. Run the review in a Claude background task.
 - Otherwise, estimate the review size before asking:
   - For working-tree review, start with `git status --short --untracked-files=all`.
@@ -35,15 +35,17 @@ Argument handling:
 - Preserve the user's arguments exactly.
 - Do not strip `--wait` or `--background` yourself.
 - Do not add extra review instructions or rewrite the user's intent.
-- The companion script parses `--wait` and `--background`, but Claude Code's `Bash(..., run_in_background: true)` is what actually detaches the run.
+- `--wait` is handled inside the companion: it spawns a detached worker, polls until completion, and prints the rendered review. If Bash kills the call (e.g. its 10-minute cap), the worker keeps running — recover with `/codex:status <jobId>` or `/codex:result <jobId>` (the jobId is printed to stderr at launch).
+- `--background` is detached by Claude Code's `Bash(..., run_in_background: true)`; the companion's `--background` parsing is currently a no-op for review and adversarial-review.
 - `/codex:review` is native-review only. It does not support staged-only review, unstaged-only review, or extra focus text.
 - If the user needs custom review instructions or more adversarial framing, they should use `/codex:adversarial-review`.
 
-Foreground flow:
+Foreground flow (no flag, or `--wait`):
 - Run:
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" review "$ARGUMENTS"
 ```
+- With `--wait`, the companion blocks on a detached worker and prints the rendered review to stdout once it completes. Use `--wait` for any review long enough to risk Bash's 10-minute cap.
 - Return the command stdout verbatim, exactly as-is.
 - Do not paraphrase, summarize, or add commentary before or after it.
 - Do not fix any issues mentioned in the review output.
